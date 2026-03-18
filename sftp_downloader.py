@@ -166,70 +166,116 @@ def make_thread_sftp(cfg: dict, logger: logging.Logger) -> SFTPClient:
 
 
 # ---------------------------------------------------------------------------
-# Discovery: collect all file tasks
+# Discovery: collect all file tasks (parallel)
 # ---------------------------------------------------------------------------
 
-def discover_tasks(
-    sftp: SFTPClient,
+def _scan_date_dir(
+    args_tuple: tuple,
+) -> List[FileTask]:
+    """
+    Worker: list files inside one market/date directory.
+    Opens its own SFTP connection so N workers run in parallel.
+    """
+    cfg, market_name, date_path, date_str, archive_root, logger = args_tuple
+    tasks: List[FileTask] = []
+    sftp = None
+    try:
+        sftp = make_thread_sftp(cfg, logger)
+        file_entries = sftp.listdir_attr(date_path)
+        for fe in file_entries:
+            fname = fe.filename
+            remote_full = f"{date_path}/{fname}"
+            local_rel = os.path.join(market_name, date_str, fname)
+            local_full = os.path.join(archive_root, local_rel)
+            tasks.append(FileTask(
+                remote_path=remote_full,
+                local_archive_path=local_full,
+                market_name=market_name,
+                date_str=date_str,
+                file_size=fe.st_size if fe.st_size else 0,
+            ))
+    except Exception as e:
+        logger.warning(f"Cannot scan {date_path}: {e}")
+    finally:
+        if sftp:
+            sftp.disconnect()
+    return tasks
+
+
+def discover_tasks_parallel(
+    cfg: dict,
     base_path: str,
     date_list: List[str],
     archive_root: str,
+    concurrent: int,
     logger: logging.Logger,
 ) -> List[FileTask]:
-    tasks: List[FileTask] = []
+    """
+    3-phase parallel discovery:
+      Phase 1: list base_path (single call, very fast)
+      Phase 2: list each market dir in parallel -> collect (market, date_path) pairs
+      Phase 3: list each date dir in parallel -> collect FileTask list
+    """
 
+    # ── Phase 1: get market list (single connection, one listdir call) ──────
+    probe = make_thread_sftp(cfg, logger)
     try:
-        entries = sftp.listdir_attr(base_path)
+        top_entries = probe.listdir_attr(base_path)
     except Exception as e:
         logger.error(f"Cannot list base path {base_path}: {e}")
-        return tasks
+        return []
+    finally:
+        probe.disconnect()
 
-    for entry in entries:
-        name = entry.filename
-        # Include USM_ but exclude USMlte_
-        if not name.startswith("USM_"):
-            continue
-        if name.startswith("USMlte_"):
-            continue
+    markets = [
+        e.filename for e in top_entries
+        if e.filename.startswith("USM_") and not e.filename.startswith("USMlte_")
+    ]
+    logger.info(f"Markets found: {len(markets)}")
 
-        market_name = name
-        market_path = f"{base_path}/{market_name}"
-        logger.info(f"Scanning market: {market_name}")
+    # ── Phase 2: for each market, find matching date dirs in parallel ────────
+    date_set = set(date_list)
 
+    def _scan_market(market_name: str) -> List[tuple]:
+        """Returns list of (market_name, date_str, date_path) tuples."""
+        result = []
+        sftp = None
         try:
+            sftp = make_thread_sftp(cfg, logger)
+            market_path = f"{base_path}/{market_name}"
             date_entries = sftp.listdir_attr(market_path)
+            for de in date_entries:
+                if de.filename in date_set:
+                    result.append((market_name, de.filename, f"{market_path}/{de.filename}"))
         except Exception as e:
-            logger.warning(f"Cannot list {market_path}: {e}")
-            continue
+            logger.warning(f"Cannot scan market {market_name}: {e}")
+        finally:
+            if sftp:
+                sftp.disconnect()
+        return result
 
-        for de in date_entries:
-            date_str = de.filename
-            if date_str not in date_list:
-                continue
+    date_dir_list: List[tuple] = []  # [(market_name, date_str, date_path), ...]
+    with ThreadPoolExecutor(max_workers=concurrent) as ex:
+        futs = {ex.submit(_scan_market, m): m for m in markets}
+        for fut in as_completed(futs):
+            date_dir_list.extend(fut.result())
 
-            date_path = f"{market_path}/{date_str}"
-            try:
-                file_entries = sftp.listdir_attr(date_path)
-            except Exception as e:
-                logger.warning(f"Cannot list {date_path}: {e}")
-                continue
+    logger.info(f"Target date directories: {len(date_dir_list)}")
 
-            for fe in file_entries:
-                fname = fe.filename
-                remote_full = f"{date_path}/{fname}"
-                local_rel = os.path.join(market_name, date_str, fname)
-                local_full = os.path.join(archive_root, local_rel)
+    # ── Phase 3: list files inside each date dir in parallel ────────────────
+    scan_args = [
+        (cfg, market_name, date_path, date_str, archive_root, logger)
+        for market_name, date_str, date_path in date_dir_list
+    ]
 
-                task = FileTask(
-                    remote_path=remote_full,
-                    local_archive_path=local_full,
-                    market_name=market_name,
-                    date_str=date_str,
-                    file_size=fe.st_size if fe.st_size else 0,
-                )
-                tasks.append(task)
+    all_tasks: List[FileTask] = []
+    discovery_workers = min(concurrent * 2, 32)  # more parallelism for listdir-only work
+    with ThreadPoolExecutor(max_workers=discovery_workers) as ex:
+        futs = [ex.submit(_scan_date_dir, args) for args in scan_args]
+        for fut in as_completed(futs):
+            all_tasks.extend(fut.result())
 
-    return tasks
+    return all_tasks
 
 
 # ---------------------------------------------------------------------------
@@ -425,17 +471,19 @@ def main():
     logger.info(f"Target dates: {date_list}")
 
     total_start = time.time()
+    concurrent = int(cfg.get("concurrent", 4))
 
-    # Step 1~3: Discover files via single SFTP connection
-    logger.info("Scanning SFTP for target files...")
-    discovery_sftp = SFTPClient(cfg, logger)
-    discovery_sftp.connect()
-
+    # Step 1~3: Discover files in parallel
+    logger.info("Scanning SFTP for target files (parallel discovery)...")
     base_path = cfg["sftp"]["base_path"]
     archive_root = cfg["paths"]["archive"]
 
-    tasks = discover_tasks(discovery_sftp, base_path, date_list, archive_root, logger)
-    discovery_sftp.disconnect()
+    discovery_start = time.time()
+    tasks = discover_tasks_parallel(
+        cfg, base_path, date_list, archive_root, concurrent, logger
+    )
+    discovery_elapsed = time.time() - discovery_start
+    logger.info(f"Discovery completed in {format_duration(discovery_elapsed)}")
 
     # Step 4: Summary of discovered files
     total_count = len(tasks)
@@ -448,9 +496,8 @@ def main():
     if total_count == 0:
         logger.info("No files to process. Exiting.")
         return
-    
+
     # Step 5~10: Process concurrently
-    concurrent = int(cfg.get("concurrent", 1))
     failed_results: List[TaskResult] = []
     success_results: List[TaskResult] = []
 
