@@ -415,7 +415,7 @@ def main():
     logger.info("=" * 60)
 
     # Load keywords
-    keywords = load_keywords(cfg.get("keyword_list_file", "keyword_list.txt"))
+    keywords = load_keywords(cfg.get("keyword_list_file", "family_list.txt"))
     logger.info(f"Keywords loaded: {keywords}")
 
     # Date range
@@ -448,7 +448,7 @@ def main():
     if total_count == 0:
         logger.info("No files to process. Exiting.")
         return
-
+    
     # Step 5~10: Process concurrently
     concurrent = int(cfg.get("concurrent", 1))
     failed_results: List[TaskResult] = []

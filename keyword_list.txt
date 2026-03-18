@@ -1,5 +1,0 @@
-keyword1
-keyword2
-important_data
-report
-summary

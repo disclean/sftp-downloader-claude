@@ -1,20 +1,20 @@
 # SFTP Connection Settings
 sftp:
-  host: "192.168.1.100"
-  port: 22
-  username: "your_username"
-  password: "your_password"
-  base_path: "/mnt/sftp"
+  host: "105.57.243.148"
+  port: 27922
+  username: "seokjun.yun"
+  password: "S@msung26!"
+  base_path: "/opt/vz_raw_data"
 
 # Local Path Settings
 paths:
-  archive: "archive/"
-  untar: "untar/"
-  temp: "tmp/"
+  archive: "/mnt/data/sea_vzw_raw_data/archive/"
+  untar: "/mnt/data/sea_vzw_raw_data/untar"
+  temp: "/mnt/data/sea_vzw_raw_data/tmp/"
   log: "logs/"
 
 # Concurrency Settings
-concurrent: 4
+concurrent: 1
 
 # Keyword list file path
-keyword_list_file: "keyword_list.txt"
+keyword_list_file: "family_list.txt"

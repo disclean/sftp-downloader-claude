@@ -1,0 +1,21 @@
+Air MAC Packet
+DL HARQ Transmission Count and BLER
+UL HARQ Transmission Count and BLER
+Downlink MIMO
+Downlink PMI in B6G
+Downlink RI
+PUCCH SINR Distribution per Bin
+PUSCH SINR Distribution per Bin
+Power Headroom Report
+Power
+Timing Advance
+Total PRB Usage
+Total PRB Usage
+Downlink Active UE Number
+Downlink MCS BLER
+Downlink MCS Transmission
+Downlink Wideband CQI
+Physical Random Access Channel in NR for beam
+RLC Packet
+Uplink UE Throughput
+Uplink MCS BLER
