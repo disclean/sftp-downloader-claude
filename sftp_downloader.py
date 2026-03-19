@@ -163,13 +163,15 @@ class SFTPClient:
         self._sftp.get(remote_path, local_path, callback=callback)
 
     def ls(self, path: str) -> List[str]:
-        """Run 'ls -1' via SSH exec channel — much faster than listdir_attr for large dirs."""
-        stdin, stdout, stderr = self._ssh.exec_command(f"ls -1 {path}", timeout=120)
-        exit_code = stdout.channel.recv_exit_status()
-        if exit_code != 0:
-            err = stderr.read().decode().strip()
-            raise RuntimeError(f"ls failed (exit {exit_code}): {err}")
-        return [line for line in stdout.read().decode().splitlines() if line.strip()]
+        """
+        Return filenames in path using SFTP listdir() — names only, no stat.
+        Falls back to listdir_attr() if listdir() is unavailable.
+        This avoids exec_command which many SFTP-only servers do not permit.
+        """
+        try:
+            return self._sftp.listdir(path)
+        except AttributeError:
+            return [e.filename for e in self._sftp.listdir_attr(path)]
 
 
 def make_thread_sftp(
@@ -215,6 +217,7 @@ class SFTPConnectionPool:
         self._pool: queue.Queue = queue.Queue()
         self._all_clients: List[SFTPClient] = []
 
+        self._broken_slots: int = 0
         logger.info(f"Initialising SFTP connection pool (size={pool_size}) ...")
         # Build connections one at a time with a small stagger to avoid
         # hitting the server with a simultaneous burst during setup.
@@ -223,33 +226,50 @@ class SFTPConnectionPool:
             self._pool.put(client)
             self._all_clients.append(client)
             if i < pool_size - 1:
-                time.sleep(0.3)   # 300 ms stagger between each new connection
+                time.sleep(0.5)   # 500 ms stagger — more conservative
         logger.info(f"Connection pool ready ({pool_size} connections)")
 
     def acquire(self) -> SFTPClient:
-        """Block until a connection is available, then return it."""
-        return self._pool.get()
+        """Block until a connection is available, reconnecting broken slots on demand."""
+        client = self._pool.get()
+        if client is None:
+            client = self._reconnect_slot()
+        return client
 
-    def release(self, client: SFTPClient):
-        """Return a connection to the pool. Reconnect if it has gone stale."""
-        try:
-            # Quick liveness check
-            client._sftp.stat(".")
-            self._pool.put(client)
-        except Exception:
-            self._logger.debug("Stale connection detected — reconnecting ...")
+    def release(self, client: SFTPClient, broken: bool = False):
+        """
+        Return a connection to the pool.
+        Pass broken=True when the caller caught an error — the slot will be
+        reconnected lazily before next use instead of right now (avoids
+        triggering a burst of reconnects when the server is under load).
+        """
+        if broken:
+            self._logger.debug("Marking pool slot for lazy reconnect ...")
             try:
                 client.disconnect()
             except Exception:
                 pass
+            # Replace with a sentinel None; acquire() will reconnect on demand
+            self._broken_slots += 1
+            self._pool.put(None)
+        else:
+            self._pool.put(client)
+
+    def _reconnect_slot(self) -> SFTPClient:
+        """Reconnect one broken slot with backoff."""
+        for attempt in range(1, 6):
             try:
-                fresh = make_thread_sftp(self._cfg, self._logger)
-                self._pool.put(fresh)
+                client = make_thread_sftp(self._cfg, self._logger)
+                self._broken_slots -= 1
+                return client
             except Exception as e:
-                self._logger.warning(f"Failed to reconnect pool slot: {e}")
-                # Put a broken client back so pool size stays consistent;
-                # next caller will hit an error and the slot will be replaced.
-                self._pool.put(client)
+                if attempt == 5:
+                    raise
+                delay = 2 * attempt
+                self._logger.warning(
+                    f"Pool reconnect attempt {attempt}/5 failed: {e} — retry in {delay}s"
+                )
+                time.sleep(delay)
 
     def close_all(self):
         """Drain the pool and disconnect every connection."""
@@ -273,6 +293,7 @@ def _scan_date_dir(
     """
     pool, market_name, date_path, date_str, archive_root, logger = args_tuple
     tasks: List[FileTask] = []
+    broken = False
     sftp = pool.acquire()
     try:
         file_entries = sftp.listdir_attr(date_path)
@@ -290,8 +311,9 @@ def _scan_date_dir(
             ))
     except Exception as e:
         logger.warning(f"Cannot scan {date_path}: {e}")
+        broken = True
     finally:
-        pool.release(sftp)
+        pool.release(sftp, broken=broken)
     return tasks
 
 
@@ -315,16 +337,22 @@ def discover_tasks_parallel(
     """
     d_workers = discovery_concurrent if discovery_concurrent else min(concurrent, 16)
 
-    # ── Phase 1: get market list via SSH ls (faster than listdir_attr) ────────
+    # ── Build pool first — Phase 1 borrows one slot from it ─────────────────
+    date_set = set(date_list)
+    pool = SFTPConnectionPool(cfg, d_workers, logger)
+
+    # ── Phase 1: get market list (SFTP listdir, names only) ─────────────────
     logger.info(f"[Phase 1/3] Listing markets in {base_path} ...")
-    probe = make_thread_sftp(cfg, logger)
+    all_names = []
+    probe = pool.acquire()
     try:
         all_names = probe.ls(base_path)
+        pool.release(probe)
     except Exception as e:
-        logger.error(f"Cannot list base path {base_path}: {e}")
+        pool.release(probe, broken=True)
+        logger.error(f"[Phase 1/3] Cannot list base path: {e}")
+        pool.close_all()
         return []
-    finally:
-        probe.disconnect()
 
     markets = [
         n for n in all_names
@@ -332,14 +360,11 @@ def discover_tasks_parallel(
     ]
     logger.info(f"[Phase 1/3] Done — markets found: {len(markets)}")
 
-    # ── Phase 2 & 3: shared connection pool ─────────────────────────────────
-    date_set = set(date_list)
-    pool = SFTPConnectionPool(cfg, d_workers, logger)
-
     try:
         # Phase 2 ── find matching date dirs inside each market ──────────────
         def _scan_market_pooled(market_name: str) -> List[tuple]:
             result = []
+            broken = False
             sftp = pool.acquire()
             try:
                 market_path = f"{base_path}/{market_name}"
@@ -349,8 +374,9 @@ def discover_tasks_parallel(
                         result.append((market_name, name, f"{market_path}/{name}"))
             except Exception as e:
                 logger.warning(f"Cannot scan market {market_name}: {e}")
+                broken = True
             finally:
-                pool.release(sftp)
+                pool.release(sftp, broken=broken)
             return result
 
         date_dir_list: List[tuple] = []
