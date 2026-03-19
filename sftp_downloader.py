@@ -158,11 +158,30 @@ class SFTPClient:
         self._sftp.get(remote_path, local_path, callback=callback)
 
 
-def make_thread_sftp(cfg: dict, logger: logging.Logger) -> SFTPClient:
-    """Create a new SFTP connection per thread."""
-    client = SFTPClient(cfg, logger)
-    client.connect()
-    return client
+def make_thread_sftp(
+    cfg: dict,
+    logger: logging.Logger,
+    max_retries: int = 5,
+    base_delay: float = 2.0,
+) -> SFTPClient:
+    """
+    Create a new SFTP connection per thread.
+    Retries on transient errors (e.g. SSH banner timeout) with exponential backoff.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            client = SFTPClient(cfg, logger)
+            client.connect()
+            return client
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))  # 2, 4, 8, 16 sec
+            logger.debug(
+                f"SFTP connect failed (attempt {attempt}/{max_retries}): {e} "
+                f"— retrying in {delay:.0f}s"
+            )
+            time.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +228,18 @@ def discover_tasks_parallel(
     archive_root: str,
     concurrent: int,
     logger: logging.Logger,
+    discovery_concurrent: Optional[int] = None,
 ) -> List[FileTask]:
     """
     3-phase parallel discovery:
       Phase 1: list base_path (single call, very fast)
       Phase 2: list each market dir in parallel -> collect (market, date_path) pairs
       Phase 3: list each date dir in parallel -> collect FileTask list
+
+    discovery_concurrent caps the SFTP connections used during discovery,
+    independent of the download concurrency setting.
     """
+    d_workers = discovery_concurrent if discovery_concurrent else min(concurrent, 16)
 
     # ── Phase 1: get market list (single connection, one listdir call) ──────
     probe = make_thread_sftp(cfg, logger)
@@ -255,8 +279,9 @@ def discover_tasks_parallel(
         return result
 
     date_dir_list: List[tuple] = []  # [(market_name, date_str, date_path), ...]
-    logger.info(f"[Phase 2/3] Scanning date dirs inside {len(markets)} markets ...")
-    with ThreadPoolExecutor(max_workers=concurrent) as ex:
+    logger.info(f"[Phase 2/3] Scanning date dirs inside {len(markets)} markets "
+                f"(workers={d_workers}) ...")
+    with ThreadPoolExecutor(max_workers=d_workers) as ex:
         futs = {ex.submit(_scan_market, m): m for m in markets}
         with tqdm(total=len(markets), desc="  Phase 2 markets ", unit="market",
                   dynamic_ncols=True) as pbar:
@@ -274,9 +299,9 @@ def discover_tasks_parallel(
     ]
 
     all_tasks: List[FileTask] = []
-    discovery_workers = min(concurrent * 2, 32)  # more parallelism for listdir-only work
-    logger.info(f"[Phase 3/3] Listing files in {len(scan_args)} date directories ...")
-    with ThreadPoolExecutor(max_workers=discovery_workers) as ex:
+    logger.info(f"[Phase 3/3] Listing files in {len(scan_args)} date directories "
+                f"(workers={d_workers}) ...")
+    with ThreadPoolExecutor(max_workers=d_workers) as ex:
         futs = [ex.submit(_scan_date_dir, args) for args in scan_args]
         with tqdm(total=len(scan_args), desc="  Phase 3 date dirs", unit="dir",
                   dynamic_ncols=True) as pbar:
@@ -490,9 +515,14 @@ def main():
     base_path = cfg["sftp"]["base_path"]
     archive_root = cfg["paths"]["archive"]
 
+    discovery_concurrent = cfg.get("discovery_concurrent", None)
+    if discovery_concurrent:
+        logger.info(f"Discovery workers capped at: {discovery_concurrent}")
+
     discovery_start = time.time()
     tasks = discover_tasks_parallel(
-        cfg, base_path, date_list, archive_root, concurrent, logger
+        cfg, base_path, date_list, archive_root, concurrent, logger,
+        discovery_concurrent=discovery_concurrent,
     )
     discovery_elapsed = time.time() - discovery_start
     logger.info(f"Discovery completed in {format_duration(discovery_elapsed)}")

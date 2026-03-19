@@ -1,20 +1,22 @@
 # SFTP Connection Settings
 sftp:
-  host: "105.57.243.148"
-  port: 27922
-  username: "seokjun.yun"
-  password: "S@msung26!"
-  base_path: "/opt/vz_raw_data"
+  host: "192.168.1.100"
+  port: 22
+  username: "your_username"
+  password: "your_password"
+  base_path: "/mnt/sftp"
 
 # Local Path Settings
 paths:
-  archive: "/mnt/data/sea_vzw_raw_data/archive/"
-  untar: "/mnt/data/sea_vzw_raw_data/untar"
-  temp: "/mnt/data/sea_vzw_raw_data/tmp/"
+  archive: "archive/"
+  untar: "untar/"
+  temp: "tmp/"
   log: "logs/"
 
 # Concurrency Settings
-concurrent: 1
+concurrent: 40          # download/preprocess worker count
+discovery_concurrent: 16  # SFTP connections used during file discovery
+                          # keep this lower than concurrent to avoid SSH banner errors
 
 # Keyword list file path
-keyword_list_file: "family_list.txt"
+keyword_list_file: "keyword_list.txt"
