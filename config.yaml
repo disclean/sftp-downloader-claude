@@ -5,6 +5,9 @@ sftp:
   username: "your_username"
   password: "your_password"
   base_path: "/mnt/sftp"
+  timeout: 60          # TCP connect timeout (seconds)
+  banner_timeout: 60   # SSH banner read timeout (seconds)
+  auth_timeout: 60     # SSH auth timeout (seconds)
 
 # Local Path Settings
 paths:

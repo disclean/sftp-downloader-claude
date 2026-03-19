@@ -128,6 +128,9 @@ class SFTPClient:
         self._lock = threading.Lock()
 
     def connect(self):
+        timeout        = int(self.cfg.get("timeout", 60))
+        banner_timeout = int(self.cfg.get("banner_timeout", 60))
+        auth_timeout   = int(self.cfg.get("auth_timeout", 60))
         self._ssh = paramiko.SSHClient()
         self._ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self._ssh.connect(
@@ -135,7 +138,9 @@ class SFTPClient:
             port=int(self.cfg["port"]),
             username=self.cfg["username"],
             password=self.cfg["password"],
-            timeout=30,
+            timeout=timeout,
+            banner_timeout=banner_timeout,
+            auth_timeout=auth_timeout,
         )
         self._sftp = self._ssh.open_sftp()
         self.logger.debug(
@@ -156,6 +161,15 @@ class SFTPClient:
 
     def get(self, remote_path: str, local_path: str, callback=None):
         self._sftp.get(remote_path, local_path, callback=callback)
+
+    def ls(self, path: str) -> List[str]:
+        """Run 'ls -1' via SSH exec channel — much faster than listdir_attr for large dirs."""
+        stdin, stdout, stderr = self._ssh.exec_command(f"ls -1 {path}", timeout=120)
+        exit_code = stdout.channel.recv_exit_status()
+        if exit_code != 0:
+            err = stderr.read().decode().strip()
+            raise RuntimeError(f"ls failed (exit {exit_code}): {err}")
+        return [line for line in stdout.read().decode().splitlines() if line.strip()]
 
 
 def make_thread_sftp(
@@ -241,10 +255,11 @@ def discover_tasks_parallel(
     """
     d_workers = discovery_concurrent if discovery_concurrent else min(concurrent, 16)
 
-    # ── Phase 1: get market list (single connection, one listdir call) ──────
+    # ── Phase 1: get market list via SSH ls (faster than listdir_attr) ────────
+    logger.info(f"[Phase 1/3] Listing markets in {base_path} ...")
     probe = make_thread_sftp(cfg, logger)
     try:
-        top_entries = probe.listdir_attr(base_path)
+        all_names = probe.ls(base_path)
     except Exception as e:
         logger.error(f"Cannot list base path {base_path}: {e}")
         return []
@@ -252,10 +267,10 @@ def discover_tasks_parallel(
         probe.disconnect()
 
     markets = [
-        e.filename for e in top_entries
-        if e.filename.startswith("USM_") and not e.filename.startswith("USMlte_")
+        n for n in all_names
+        if n.startswith("USM_") and not n.startswith("USMlte_")
     ]
-    logger.info(f"Markets found: {len(markets)}")
+    logger.info(f"[Phase 1/3] Done — markets found: {len(markets)}")
 
     # ── Phase 2: for each market, find matching date dirs in parallel ────────
     date_set = set(date_list)
@@ -267,10 +282,11 @@ def discover_tasks_parallel(
         try:
             sftp = make_thread_sftp(cfg, logger)
             market_path = f"{base_path}/{market_name}"
-            date_entries = sftp.listdir_attr(market_path)
-            for de in date_entries:
-                if de.filename in date_set:
-                    result.append((market_name, de.filename, f"{market_path}/{de.filename}"))
+            # Use ls (SSH exec) instead of listdir_attr to avoid per-entry stat calls
+            dir_names = sftp.ls(market_path)
+            for name in dir_names:
+                if name in date_set:
+                    result.append((market_name, name, f"{market_path}/{name}"))
         except Exception as e:
             logger.warning(f"Cannot scan market {market_name}: {e}")
         finally:
