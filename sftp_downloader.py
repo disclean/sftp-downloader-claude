@@ -501,15 +501,15 @@ def preprocess_file(
 
 def process_task(
     task: FileTask,
+    pool: "SFTPConnectionPool",
     cfg: dict,
     keywords: List[str],
     logger: logging.Logger,
     global_pbar: tqdm,
 ) -> TaskResult:
-    sftp = None
+    broken = False
+    sftp = pool.acquire()
     try:
-        sftp = make_thread_sftp(cfg, logger)
-
         # Ensure local directory exists
         os.makedirs(os.path.dirname(task.local_archive_path), exist_ok=True)
 
@@ -549,13 +549,12 @@ def process_task(
         return TaskResult(task=task, success=True, untar_files=moved)
 
     except Exception as e:
+        broken = True
         logger.error(f"Error processing {task.remote_path}: {e}")
         return TaskResult(task=task, success=False, error_msg=str(e))
 
     finally:
-        if sftp:
-            sftp.disconnect()
-        # Update global progress bar
+        pool.release(sftp, broken=broken)
         global_pbar.update(1)
 
 
@@ -643,12 +642,14 @@ def main():
         logger.info("No files to process. Exiting.")
         return
 
-    # Step 5~10: Process concurrently
+    # Step 5~10: Process concurrently using a shared download connection pool
+    logger.info(f"Initialising download connection pool (size={concurrent}) ...")
+    dl_pool = SFTPConnectionPool(cfg, concurrent, logger)
+
     failed_results: List[TaskResult] = []
     success_results: List[TaskResult] = []
 
     completed = 0
-    task_start_times = {}
 
     global_pbar = tqdm(
         total=total_count,
@@ -659,36 +660,37 @@ def main():
 
     wall_start = time.time()
 
-    with ThreadPoolExecutor(max_workers=concurrent) as executor:
-        future_map = {}
-        for i, task in enumerate(tasks):
-            task_start_times[i] = time.time()
-            fut = executor.submit(
-                process_task, task, cfg, keywords, logger, global_pbar
-            )
-            future_map[fut] = i
-
-        for fut in as_completed(future_map):
-            idx = future_map[fut]
-            result: TaskResult = fut.result()
-
-            completed += 1
-            elapsed = time.time() - wall_start
-            avg_per_file = elapsed / completed
-            remaining = (total_count - completed) * avg_per_file
-
-            if result.success:
-                success_results.append(result)
-                logger.info(
-                    f"[{completed}/{total_count}] OK: {os.path.basename(result.task.remote_path)}"
-                    f" | ETA: {format_duration(remaining)}"
+    try:
+        with ThreadPoolExecutor(max_workers=concurrent) as executor:
+            future_map = {}
+            for task in tasks:
+                fut = executor.submit(
+                    process_task, task, dl_pool, cfg, keywords, logger, global_pbar
                 )
-            else:
-                failed_results.append(result)
-                logger.warning(
-                    f"[{completed}/{total_count}] FAIL: {os.path.basename(result.task.remote_path)}"
-                    f" | ETA: {format_duration(remaining)}"
-                )
+                future_map[fut] = task
+
+            for fut in as_completed(future_map):
+                result: TaskResult = fut.result()
+
+                completed += 1
+                elapsed = time.time() - wall_start
+                avg_per_file = elapsed / completed
+                remaining = (total_count - completed) * avg_per_file
+
+                if result.success:
+                    success_results.append(result)
+                    logger.info(
+                        f"[{completed}/{total_count}] OK: {os.path.basename(result.task.remote_path)}"
+                        f" | ETA: {format_duration(remaining)}"
+                    )
+                else:
+                    failed_results.append(result)
+                    logger.warning(
+                        f"[{completed}/{total_count}] FAIL: {os.path.basename(result.task.remote_path)}"
+                        f" | ETA: {format_duration(remaining)}"
+                    )
+    finally:
+        dl_pool.close_all()
 
     global_pbar.close()
 
