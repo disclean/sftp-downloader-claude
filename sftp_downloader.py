@@ -33,19 +33,27 @@ from tqdm import tqdm
 # ---------------------------------------------------------------------------
 
 @dataclass
-class FileTask:
-    remote_path: str       # full remote path
-    local_archive_path: str  # local destination inside archive/
+class FolderTask:
+    remote_date_path: str      # full remote path to date folder
+    local_date_path: str       # local destination: archive/market/date/
     market_name: str
     date_str: str
-    file_size: int = 0
+    file_count: int = 0        # number of tar.gz files in the date folder
+    total_size: int = 0        # sum of file sizes
 
 
 @dataclass
-class TaskResult:
-    task: FileTask
+class ErrorDetail:
+    date_path: str
+    filename: str
+    reason: str
+
+
+@dataclass
+class FolderResult:
+    task: FolderTask
     success: bool
-    error_msg: str = ""
+    error_details: List["ErrorDetail"] = field(default_factory=list)
     untar_files: List[str] = field(default_factory=list)
 
 
@@ -287,34 +295,33 @@ class SFTPConnectionPool:
 
 def _scan_date_dir(
     args_tuple: tuple,
-) -> List[FileTask]:
+) -> List[FolderTask]:
     """
-    Worker: list files inside one market/date directory using a shared pool.
+    Worker: stat files in one market/date directory and return a single FolderTask.
     """
     pool, market_name, date_path, date_str, archive_root, logger = args_tuple
-    tasks: List[FileTask] = []
     broken = False
     sftp = pool.acquire()
     try:
         file_entries = sftp.listdir_attr(date_path)
-        for fe in file_entries:
-            fname = fe.filename
-            remote_full = f"{date_path}/{fname}"
-            local_rel = os.path.join(market_name, date_str, fname)
-            local_full = os.path.join(archive_root, local_rel)
-            tasks.append(FileTask(
-                remote_path=remote_full,
-                local_archive_path=local_full,
-                market_name=market_name,
-                date_str=date_str,
-                file_size=fe.st_size if fe.st_size else 0,
-            ))
+        tar_entries = [fe for fe in file_entries if fe.filename.endswith(".tar.gz")]
+        file_count  = len(tar_entries)
+        total_size  = sum(fe.st_size for fe in tar_entries if fe.st_size)
+        local_date_path = os.path.join(archive_root, market_name, date_str)
+        return [FolderTask(
+            remote_date_path=date_path,
+            local_date_path=local_date_path,
+            market_name=market_name,
+            date_str=date_str,
+            file_count=file_count,
+            total_size=total_size,
+        )]
     except Exception as e:
         logger.warning(f"Cannot scan {date_path}: {e}")
         broken = True
+        return []
     finally:
         pool.release(sftp, broken=broken)
-    return tasks
 
 
 def discover_tasks_parallel(
@@ -325,12 +332,12 @@ def discover_tasks_parallel(
     concurrent: int,
     logger: logging.Logger,
     discovery_concurrent: Optional[int] = None,
-) -> List[FileTask]:
+) -> List[FolderTask]:
     """
     3-phase parallel discovery:
       Phase 1: list base_path (single call, very fast)
       Phase 2: list each market dir in parallel -> collect (market, date_path) pairs
-      Phase 3: list each date dir in parallel -> collect FileTask list
+      Phase 3: list each date dir in parallel -> collect FolderTask list
 
     discovery_concurrent caps the SFTP connections used during discovery,
     independent of the download concurrency setting.
@@ -399,7 +406,7 @@ def discover_tasks_parallel(
             for market_name, date_str, date_path in date_dir_list
         ]
 
-        all_tasks: List[FileTask] = []
+        all_tasks: List[FolderTask] = []
         logger.info(f"[Phase 3/3] Listing files in {len(scan_args)} date directories "
                     f"(pool={d_workers}) ...")
         with ThreadPoolExecutor(max_workers=d_workers) as ex:
@@ -412,146 +419,203 @@ def discover_tasks_parallel(
                     pbar.update(1)
                     pbar.set_postfix({"files_found": len(all_tasks)})
 
-        logger.info(f"[Phase 3/3] Done — total files found: {len(all_tasks)}")
+        logger.info(f"[Phase 3/3] Done — total folders queued: {len(all_tasks)}")
         return all_tasks
 
     finally:
         pool.close_all()
+        logger.info("Discovery connection pool closed.")
 
 
 # ---------------------------------------------------------------------------
-# Progress callback for individual file download
+# Download: recursively download a remote date folder
 # ---------------------------------------------------------------------------
 
-def make_progress_bar(filename: str, total_size: int) -> Tuple[tqdm, callable]:
-    pbar = tqdm(
-        total=total_size,
-        unit="B",
-        unit_scale=True,
-        unit_divisor=1024,
-        desc=f"  {filename[:40]}",
-        leave=False,
-        dynamic_ncols=True,
-    )
+def download_folder(
+    sftp: "SFTPClient",
+    remote_dir: str,
+    local_dir: str,
+    logger: logging.Logger,
+) -> List[str]:
+    """
+    Download all tar.gz files from remote_dir into local_dir.
+    Returns list of local file paths downloaded.
+    """
+    os.makedirs(local_dir, exist_ok=True)
+    entries = sftp.listdir_attr(remote_dir)
+    tar_entries = [e for e in entries if e.filename.endswith(".tar.gz")]
+    downloaded = []
 
-    def callback(transferred: int, total: int):
-        pbar.n = transferred
-        pbar.refresh()
+    for fe in tar_entries:
+        remote_path = f"{remote_dir}/{fe.filename}"
+        local_path  = os.path.join(local_dir, fe.filename)
+        file_size   = fe.st_size or 0
+        logger.debug(f"  Downloading {fe.filename} ({file_size/1024/1024:.1f} MB)")
+        sftp.get(remote_path, local_path)
+        downloaded.append(local_path)
 
-    return pbar, callback
+    return downloaded
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing: untar and filter by keywords
+# Preprocess: untar and filter by keyword_name
 # ---------------------------------------------------------------------------
 
-def preprocess_file(
-    archive_path: str,
+def preprocess_folder(
+    local_date_path: str,
     market_name: str,
     untar_root: str,
     keywords: List[str],
     logger: logging.Logger,
-) -> List[str]:
+) -> tuple:
     """
-    Extract tar.gz, filter by keywords, move matching files to untar_root/market_name/.
-    Returns list of moved file paths.
+    1. Extract non-_RE_ tar.gz files into tmp_dir
+    2. Extract _RE_ tar.gz files into same tmp_dir (overwrite)
+    3. For each extracted file:
+         keyword_name = filename.split('_')[1]
+         if keyword_name in keywords → move to untar_root/market_name/keyword_name/
+         else                        → delete
+    Returns (moved_files, error_details).
     """
+    moved_files: List[str]    = []
+    error_details: List[dict] = []
+
+    # Gather tar.gz files
+    all_tars = sorted(
+        f for f in os.listdir(local_date_path) if f.endswith(".tar.gz")
+    )
+    non_re = [f for f in all_tars if "_RE_" not in f]
+    re_    = [f for f in all_tars if "_RE_" in f]
+
     tmp_dir = tempfile.mkdtemp(prefix="sftp_untar_")
-    moved_files = []
-
     try:
-        # Extract
-        logger.debug(f"Extracting {archive_path} -> {tmp_dir}")
-        with tarfile.open(archive_path, "r:gz") as tar:
-            tar.extractall(path=tmp_dir)
+        # Step 1: extract non-_RE_ files
+        for fname in non_re:
+            fpath = os.path.join(local_date_path, fname)
+            try:
+                with tarfile.open(fpath, "r:gz") as tar:
+                    tar.extractall(path=tmp_dir)
+                logger.debug(f"  Extracted (non-RE): {fname}")
+            except Exception as e:
+                error_details.append({"filename": fname, "reason": f"extract failed: {e}"})
+                logger.warning(f"  Extract failed [{fname}]: {e}")
 
-        # Walk extracted files
-        dest_dir = os.path.join(untar_root, market_name)
-        os.makedirs(dest_dir, exist_ok=True)
+        # Step 2: extract _RE_ files (overwrite)
+        for fname in re_:
+            fpath = os.path.join(local_date_path, fname)
+            try:
+                with tarfile.open(fpath, "r:gz") as tar:
+                    tar.extractall(path=tmp_dir)
+                logger.debug(f"  Extracted (_RE_): {fname}")
+            except Exception as e:
+                error_details.append({"filename": fname, "reason": f"extract failed: {e}"})
+                logger.warning(f"  Extract failed [{fname}]: {e}")
 
-        for root, dirs, files in os.walk(tmp_dir):
-            for fname in files:
-                full_path = os.path.join(root, fname)
-                matched = any(kw in fname for kw in keywords) if keywords else True
+        # Step 3: classify and move/delete extracted files
+        for fname in os.listdir(tmp_dir):
+            full_path = os.path.join(tmp_dir, fname)
+            if not os.path.isfile(full_path):
+                continue
+            try:
+                parts = fname.split("_")
+                keyword_name = parts[1] if len(parts) > 1 else ""
+            except Exception:
+                keyword_name = ""
 
-                if matched:
-                    dest_path = os.path.join(dest_dir, fname)
-                    # Handle duplicates
-                    if os.path.exists(dest_path):
-                        base, ext = os.path.splitext(fname)
-                        dest_path = os.path.join(
-                            dest_dir, f"{base}_{int(time.time())}{ext}"
-                        )
-                    shutil.move(full_path, dest_path)
-                    moved_files.append(dest_path)
-                    logger.debug(f"  Kept: {fname} -> {dest_path}")
-                else:
-                    os.remove(full_path)
-                    logger.debug(f"  Removed (no keyword match): {fname}")
+            if keyword_name and keyword_name in keywords:
+                dest_dir = os.path.join(untar_root, market_name, keyword_name)
+                os.makedirs(dest_dir, exist_ok=True)
+                dest_path = os.path.join(dest_dir, fname)
+                shutil.move(full_path, dest_path)
+                moved_files.append(dest_path)
+                logger.debug(f"  Kept [{keyword_name}]: {fname}")
+            else:
+                os.remove(full_path)
+                logger.debug(f"  Deleted (keyword '{keyword_name}' not in list): {fname}")
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    return moved_files
+    return moved_files, error_details
 
 
 # ---------------------------------------------------------------------------
-# Worker: download + preprocess one file
+# Worker: download + preprocess one date folder
 # ---------------------------------------------------------------------------
 
-def process_task(
-    task: FileTask,
+def process_folder(
+    task: FolderTask,
     pool: "SFTPConnectionPool",
     cfg: dict,
     keywords: List[str],
     logger: logging.Logger,
     global_pbar: tqdm,
-) -> TaskResult:
+) -> FolderResult:
+    tag = f"{task.market_name}/{task.date_str}"
     broken = False
     sftp = pool.acquire()
+    error_details: List[ErrorDetail] = []
+
     try:
-        # Ensure local directory exists
-        os.makedirs(os.path.dirname(task.local_archive_path), exist_ok=True)
-
-        # Download with progress
-        fname = os.path.basename(task.remote_path)
-        pbar, cb = make_progress_bar(fname, task.file_size)
-
+        # ── Download entire date folder ──────────────────────────────────────
         dl_start = time.time()
-        sftp.get(task.remote_path, task.local_archive_path, callback=cb)
+        downloaded = download_folder(
+            sftp, task.remote_date_path, task.local_date_path, logger
+        )
         dl_elapsed = time.time() - dl_start
-
-        pbar.close()
-
-        dl_size = os.path.getsize(task.local_archive_path)
+        dl_size = sum(os.path.getsize(p) for p in downloaded)
         speed = dl_size / dl_elapsed / 1024 / 1024 if dl_elapsed > 0 else 0
         logger.info(
-            f"Downloaded: {fname} ({dl_size/1024/1024:.2f} MB, {speed:.2f} MB/s)"
+            f"[DL] {tag} — {len(downloaded)} files, "
+            f"{human_size(dl_size)}, {speed:.2f} MB/s"
         )
 
-        # Preprocess (untar + filter)
+        # ── Preprocess (untar + keyword filter) ─────────────────────────────
         untar_root = cfg["paths"]["untar"]
-        moved = preprocess_file(
-            task.local_archive_path,
+        moved, preproc_errors = preprocess_folder(
+            task.local_date_path,
             task.market_name,
             untar_root,
             keywords,
             logger,
         )
+        for pe in preproc_errors:
+            error_details.append(ErrorDetail(
+                date_path=task.remote_date_path,
+                filename=pe["filename"],
+                reason=pe["reason"],
+            ))
+
         logger.info(
-            f"Preprocessed: {fname} -> {len(moved)} file(s) kept in {untar_root}"
+            f"[PP] {tag} — {len(moved)} file(s) kept, "
+            f"{len(preproc_errors)} error(s)"
         )
 
-        # Remove archive after success
-        os.remove(task.local_archive_path)
-        logger.debug(f"Removed archive: {task.local_archive_path}")
+        # ── Remove local date folder on full success ─────────────────────────
+        if not preproc_errors:
+            shutil.rmtree(task.local_date_path, ignore_errors=True)
+            logger.debug(f"Removed local folder: {task.local_date_path}")
+        else:
+            logger.warning(
+                f"Keeping local folder due to errors: {task.local_date_path}"
+            )
 
-        return TaskResult(task=task, success=True, untar_files=moved)
+        return FolderResult(
+            task=task,
+            success=True,
+            error_details=error_details,
+            untar_files=moved,
+        )
 
     except Exception as e:
         broken = True
-        logger.error(f"Error processing {task.remote_path}: {e}")
-        return TaskResult(task=task, success=False, error_msg=str(e))
+        logger.error(f"Error processing folder {tag}: {e}")
+        error_details.append(ErrorDetail(
+            date_path=task.remote_date_path,
+            filename="<folder>",
+            reason=str(e),
+        ))
+        return FolderResult(task=task, success=False, error_details=error_details)
 
     finally:
         pool.release(sftp, broken=broken)
@@ -630,31 +694,32 @@ def main():
     discovery_elapsed = time.time() - discovery_start
     logger.info(f"Discovery completed in {format_duration(discovery_elapsed)}")
 
-    # Step 4: Summary of discovered files
-    total_count = len(tasks)
-    total_size = sum(t.file_size for t in tasks)
+    # Step 4: Summary of discovered folders
+    total_folders = len(tasks)
+    total_files   = sum(t.file_count for t in tasks)
+    total_size    = sum(t.total_size  for t in tasks)
     logger.info("=" * 60)
-    logger.info(f"Files to download : {total_count}")
-    logger.info(f"Total size        : {human_size(total_size)}")
+    logger.info(f"Folders to process : {total_folders}")
+    logger.info(f"Total tar.gz files : {total_files}")
+    logger.info(f"Total size         : {human_size(total_size)}")
     logger.info("=" * 60)
 
-    if total_count == 0:
-        logger.info("No files to process. Exiting.")
+    if total_folders == 0:
+        logger.info("No folders to process. Exiting.")
         return
 
     # Step 5~10: Process concurrently using a shared download connection pool
     logger.info(f"Initialising download connection pool (size={concurrent}) ...")
     dl_pool = SFTPConnectionPool(cfg, concurrent, logger)
 
-    failed_results: List[TaskResult] = []
-    success_results: List[TaskResult] = []
-
+    failed_results:  List[FolderResult] = []
+    success_results: List[FolderResult] = []
     completed = 0
 
     global_pbar = tqdm(
-        total=total_count,
+        total=total_folders,
         desc="Overall progress",
-        unit="file",
+        unit="folder",
         dynamic_ncols=True,
     )
 
@@ -662,64 +727,62 @@ def main():
 
     try:
         with ThreadPoolExecutor(max_workers=concurrent) as executor:
-            future_map = {}
-            for task in tasks:
-                fut = executor.submit(
-                    process_task, task, dl_pool, cfg, keywords, logger, global_pbar
-                )
-                future_map[fut] = task
+            future_map = {
+                executor.submit(
+                    process_folder, task, dl_pool, cfg, keywords, logger, global_pbar
+                ): task
+                for task in tasks
+            }
 
             for fut in as_completed(future_map):
-                result: TaskResult = fut.result()
-
+                result: FolderResult = fut.result()
                 completed += 1
-                elapsed = time.time() - wall_start
-                avg_per_file = elapsed / completed
-                remaining = (total_count - completed) * avg_per_file
+                elapsed     = time.time() - wall_start
+                avg         = elapsed / completed
+                remaining   = (total_folders - completed) * avg
+                tag = f"{result.task.market_name}/{result.task.date_str}"
 
                 if result.success:
                     success_results.append(result)
                     logger.info(
-                        f"[{completed}/{total_count}] OK: {os.path.basename(result.task.remote_path)}"
+                        f"[{completed}/{total_folders}] OK : {tag}"
                         f" | ETA: {format_duration(remaining)}"
                     )
                 else:
                     failed_results.append(result)
                     logger.warning(
-                        f"[{completed}/{total_count}] FAIL: {os.path.basename(result.task.remote_path)}"
+                        f"[{completed}/{total_folders}] FAIL: {tag}"
                         f" | ETA: {format_duration(remaining)}"
                     )
     finally:
         dl_pool.close_all()
+        logger.info("Download connection pool closed.")
 
     global_pbar.close()
 
     # Step 11: Final summary
-    total_elapsed = time.time() - total_start
-
-    untar_files_all = [f for r in success_results for f in r.untar_files]
+    total_elapsed    = time.time() - total_start
+    untar_files_all  = [f for r in success_results for f in r.untar_files]
     untar_total_size = sum(os.path.getsize(f) for f in untar_files_all if os.path.exists(f))
-
-    # Download summary (using original task sizes for successfully downloaded)
-    downloaded_size = sum(r.task.file_size for r in success_results)
+    all_errors       = [e for r in success_results + failed_results for e in r.error_details]
 
     logger.info("")
     logger.info("=" * 60)
     logger.info("FINAL SUMMARY")
     logger.info("=" * 60)
-    logger.info(f"  Total files scanned    : {total_count}")
-    logger.info(f"  Downloaded (success)   : {len(success_results)} files / {human_size(downloaded_size)}")
-    logger.info(f"  Preprocessed files     : {len(untar_files_all)} files / {human_size(untar_total_size)}")
-    logger.info(f"  Failed                 : {len(failed_results)}")
-    logger.info(f"  Total elapsed          : {format_duration(total_elapsed)}")
+    logger.info(f"  Total folders      : {total_folders}")
+    logger.info(f"  Success            : {len(success_results)}")
+    logger.info(f"  Failed             : {len(failed_results)}")
+    logger.info(f"  Kept files         : {len(untar_files_all)} / {human_size(untar_total_size)}")
+    logger.info(f"  Total elapsed      : {format_duration(total_elapsed)}")
     logger.info("=" * 60)
 
-    if failed_results:
+    if all_errors:
         logger.warning("")
-        logger.warning("FAILED FILES:")
-        for r in failed_results:
-            logger.warning(f"  {r.task.remote_path}")
-            logger.warning(f"    Reason: {r.error_msg}")
+        logger.warning("ERROR DETAILS:")
+        for e in all_errors:
+            logger.warning(f"  [{e.date_path}] {e.filename}")
+            logger.warning(f"    Reason: {e.reason}")
 
     logger.info("Done.")
 
