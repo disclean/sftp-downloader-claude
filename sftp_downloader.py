@@ -199,6 +199,69 @@ def make_thread_sftp(
 
 
 # ---------------------------------------------------------------------------
+# SFTP Connection Pool
+# ---------------------------------------------------------------------------
+
+class SFTPConnectionPool:
+    """
+    Fixed-size pool of persistent SFTP connections.
+    Workers borrow a connection, use it, then return it.
+    Total simultaneous SSH connections = pool_size (never exceeds this).
+    """
+
+    def __init__(self, cfg: dict, pool_size: int, logger: logging.Logger):
+        self._cfg = cfg
+        self._logger = logger
+        self._pool: queue.Queue = queue.Queue()
+        self._all_clients: List[SFTPClient] = []
+
+        logger.info(f"Initialising SFTP connection pool (size={pool_size}) ...")
+        # Build connections one at a time with a small stagger to avoid
+        # hitting the server with a simultaneous burst during setup.
+        for i in range(pool_size):
+            client = make_thread_sftp(cfg, logger)
+            self._pool.put(client)
+            self._all_clients.append(client)
+            if i < pool_size - 1:
+                time.sleep(0.3)   # 300 ms stagger between each new connection
+        logger.info(f"Connection pool ready ({pool_size} connections)")
+
+    def acquire(self) -> SFTPClient:
+        """Block until a connection is available, then return it."""
+        return self._pool.get()
+
+    def release(self, client: SFTPClient):
+        """Return a connection to the pool. Reconnect if it has gone stale."""
+        try:
+            # Quick liveness check
+            client._sftp.stat(".")
+            self._pool.put(client)
+        except Exception:
+            self._logger.debug("Stale connection detected — reconnecting ...")
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+            try:
+                fresh = make_thread_sftp(self._cfg, self._logger)
+                self._pool.put(fresh)
+            except Exception as e:
+                self._logger.warning(f"Failed to reconnect pool slot: {e}")
+                # Put a broken client back so pool size stays consistent;
+                # next caller will hit an error and the slot will be replaced.
+                self._pool.put(client)
+
+    def close_all(self):
+        """Drain the pool and disconnect every connection."""
+        while not self._pool.empty():
+            try:
+                c = self._pool.get_nowait()
+                c.disconnect()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Discovery: collect all file tasks (parallel)
 # ---------------------------------------------------------------------------
 
@@ -206,14 +269,12 @@ def _scan_date_dir(
     args_tuple: tuple,
 ) -> List[FileTask]:
     """
-    Worker: list files inside one market/date directory.
-    Opens its own SFTP connection so N workers run in parallel.
+    Worker: list files inside one market/date directory using a shared pool.
     """
-    cfg, market_name, date_path, date_str, archive_root, logger = args_tuple
+    pool, market_name, date_path, date_str, archive_root, logger = args_tuple
     tasks: List[FileTask] = []
-    sftp = None
+    sftp = pool.acquire()
     try:
-        sftp = make_thread_sftp(cfg, logger)
         file_entries = sftp.listdir_attr(date_path)
         for fe in file_entries:
             fname = fe.filename
@@ -230,8 +291,7 @@ def _scan_date_dir(
     except Exception as e:
         logger.warning(f"Cannot scan {date_path}: {e}")
     finally:
-        if sftp:
-            sftp.disconnect()
+        pool.release(sftp)
     return tasks
 
 
@@ -272,63 +332,65 @@ def discover_tasks_parallel(
     ]
     logger.info(f"[Phase 1/3] Done — markets found: {len(markets)}")
 
-    # ── Phase 2: for each market, find matching date dirs in parallel ────────
+    # ── Phase 2 & 3: shared connection pool ─────────────────────────────────
     date_set = set(date_list)
+    pool = SFTPConnectionPool(cfg, d_workers, logger)
 
-    def _scan_market(market_name: str) -> List[tuple]:
-        """Returns list of (market_name, date_str, date_path) tuples."""
-        result = []
-        sftp = None
-        try:
-            sftp = make_thread_sftp(cfg, logger)
-            market_path = f"{base_path}/{market_name}"
-            # Use ls (SSH exec) instead of listdir_attr to avoid per-entry stat calls
-            dir_names = sftp.ls(market_path)
-            for name in dir_names:
-                if name in date_set:
-                    result.append((market_name, name, f"{market_path}/{name}"))
-        except Exception as e:
-            logger.warning(f"Cannot scan market {market_name}: {e}")
-        finally:
-            if sftp:
-                sftp.disconnect()
-        return result
+    try:
+        # Phase 2 ── find matching date dirs inside each market ──────────────
+        def _scan_market_pooled(market_name: str) -> List[tuple]:
+            result = []
+            sftp = pool.acquire()
+            try:
+                market_path = f"{base_path}/{market_name}"
+                dir_names = sftp.ls(market_path)
+                for name in dir_names:
+                    if name in date_set:
+                        result.append((market_name, name, f"{market_path}/{name}"))
+            except Exception as e:
+                logger.warning(f"Cannot scan market {market_name}: {e}")
+            finally:
+                pool.release(sftp)
+            return result
 
-    date_dir_list: List[tuple] = []  # [(market_name, date_str, date_path), ...]
-    logger.info(f"[Phase 2/3] Scanning date dirs inside {len(markets)} markets "
-                f"(workers={d_workers}) ...")
-    with ThreadPoolExecutor(max_workers=d_workers) as ex:
-        futs = {ex.submit(_scan_market, m): m for m in markets}
-        with tqdm(total=len(markets), desc="  Phase 2 markets ", unit="market",
-                  dynamic_ncols=True) as pbar:
-            for fut in as_completed(futs):
-                date_dir_list.extend(fut.result())
-                pbar.update(1)
-                pbar.set_postfix({"date_dirs": len(date_dir_list)})
+        date_dir_list: List[tuple] = []
+        logger.info(f"[Phase 2/3] Scanning date dirs inside {len(markets)} markets "
+                    f"(pool={d_workers}) ...")
+        with ThreadPoolExecutor(max_workers=d_workers) as ex:
+            futs = {ex.submit(_scan_market_pooled, m): m for m in markets}
+            with tqdm(total=len(markets), desc="  Phase 2 markets ", unit="market",
+                      dynamic_ncols=True) as pbar:
+                for fut in as_completed(futs):
+                    date_dir_list.extend(fut.result())
+                    pbar.update(1)
+                    pbar.set_postfix({"date_dirs": len(date_dir_list)})
 
-    logger.info(f"[Phase 2/3] Done — target date directories: {len(date_dir_list)}")
+        logger.info(f"[Phase 2/3] Done — target date directories: {len(date_dir_list)}")
 
-    # ── Phase 3: list files inside each date dir in parallel ────────────────
-    scan_args = [
-        (cfg, market_name, date_path, date_str, archive_root, logger)
-        for market_name, date_str, date_path in date_dir_list
-    ]
+        # Phase 3 ── list files inside each date dir ─────────────────────────
+        scan_args = [
+            (pool, market_name, date_path, date_str, archive_root, logger)
+            for market_name, date_str, date_path in date_dir_list
+        ]
 
-    all_tasks: List[FileTask] = []
-    logger.info(f"[Phase 3/3] Listing files in {len(scan_args)} date directories "
-                f"(workers={d_workers}) ...")
-    with ThreadPoolExecutor(max_workers=d_workers) as ex:
-        futs = [ex.submit(_scan_date_dir, args) for args in scan_args]
-        with tqdm(total=len(scan_args), desc="  Phase 3 date dirs", unit="dir",
-                  dynamic_ncols=True) as pbar:
-            for fut in as_completed(futs):
-                result = fut.result()
-                all_tasks.extend(result)
-                pbar.update(1)
-                pbar.set_postfix({"files_found": len(all_tasks)})
+        all_tasks: List[FileTask] = []
+        logger.info(f"[Phase 3/3] Listing files in {len(scan_args)} date directories "
+                    f"(pool={d_workers}) ...")
+        with ThreadPoolExecutor(max_workers=d_workers) as ex:
+            futs = [ex.submit(_scan_date_dir, args) for args in scan_args]
+            with tqdm(total=len(scan_args), desc="  Phase 3 date dirs", unit="dir",
+                      dynamic_ncols=True) as pbar:
+                for fut in as_completed(futs):
+                    result = fut.result()
+                    all_tasks.extend(result)
+                    pbar.update(1)
+                    pbar.set_postfix({"files_found": len(all_tasks)})
 
-    logger.info(f"[Phase 3/3] Done — total files found: {len(all_tasks)}")
-    return all_tasks
+        logger.info(f"[Phase 3/3] Done — total files found: {len(all_tasks)}")
+        return all_tasks
+
+    finally:
+        pool.close_all()
 
 
 # ---------------------------------------------------------------------------
