@@ -138,7 +138,7 @@ class SFTPClient:
             timeout=30,
         )
         self._sftp = self._ssh.open_sftp()
-        self.logger.info(
+        self.logger.debug(
             f"Connected to SFTP: {self.cfg['host']}:{self.cfg['port']}"
         )
 
@@ -255,12 +255,17 @@ def discover_tasks_parallel(
         return result
 
     date_dir_list: List[tuple] = []  # [(market_name, date_str, date_path), ...]
+    logger.info(f"[Phase 2/3] Scanning date dirs inside {len(markets)} markets ...")
     with ThreadPoolExecutor(max_workers=concurrent) as ex:
         futs = {ex.submit(_scan_market, m): m for m in markets}
-        for fut in as_completed(futs):
-            date_dir_list.extend(fut.result())
+        with tqdm(total=len(markets), desc="  Phase 2 markets ", unit="market",
+                  dynamic_ncols=True) as pbar:
+            for fut in as_completed(futs):
+                date_dir_list.extend(fut.result())
+                pbar.update(1)
+                pbar.set_postfix({"date_dirs": len(date_dir_list)})
 
-    logger.info(f"Target date directories: {len(date_dir_list)}")
+    logger.info(f"[Phase 2/3] Done — target date directories: {len(date_dir_list)}")
 
     # ── Phase 3: list files inside each date dir in parallel ────────────────
     scan_args = [
@@ -270,11 +275,18 @@ def discover_tasks_parallel(
 
     all_tasks: List[FileTask] = []
     discovery_workers = min(concurrent * 2, 32)  # more parallelism for listdir-only work
+    logger.info(f"[Phase 3/3] Listing files in {len(scan_args)} date directories ...")
     with ThreadPoolExecutor(max_workers=discovery_workers) as ex:
         futs = [ex.submit(_scan_date_dir, args) for args in scan_args]
-        for fut in as_completed(futs):
-            all_tasks.extend(fut.result())
+        with tqdm(total=len(scan_args), desc="  Phase 3 date dirs", unit="dir",
+                  dynamic_ncols=True) as pbar:
+            for fut in as_completed(futs):
+                result = fut.result()
+                all_tasks.extend(result)
+                pbar.update(1)
+                pbar.set_postfix({"files_found": len(all_tasks)})
 
+    logger.info(f"[Phase 3/3] Done — total files found: {len(all_tasks)}")
     return all_tasks
 
 
@@ -461,7 +473,7 @@ def main():
     logger.info("=" * 60)
 
     # Load keywords
-    keywords = load_keywords(cfg.get("keyword_list_file", "family_list.txt"))
+    keywords = load_keywords(cfg.get("keyword_list_file", "keyword_list.txt"))
     logger.info(f"Keywords loaded: {keywords}")
 
     # Date range
