@@ -467,6 +467,7 @@ def preprocess_folder(
     untar_root: str,
     keywords: List[str],
     logger: logging.Logger,
+    temp_root: str = "",
 ) -> tuple:
     """
     1. Extract non-_RE_ tar.gz files into tmp_dir
@@ -476,6 +477,7 @@ def preprocess_folder(
          if keyword_name in keywords → move to untar_root/market_name/keyword_name/
          else                        → delete
     Returns (moved_files, error_details).
+    temp_root: base directory for temporary extraction; uses OS default if empty.
     """
     moved_files: List[str]    = []
     error_details: List[dict] = []
@@ -487,12 +489,8 @@ def preprocess_folder(
     non_re = [f for f in all_tars if "_RE_" not in f]
     re_    = [f for f in all_tars if "_RE_" in f]
 
-    logger.info(
-        f"  [PP] {market_name} | tar.gz total={len(all_tars)} "
-        f"non-RE={len(non_re)} RE={len(re_)} | keywords={keywords}"
-    )
-
-    tmp_dir = tempfile.mkdtemp(prefix="sftp_untar_")
+    os.makedirs(temp_root, exist_ok=True) if temp_root else None
+    tmp_dir = tempfile.mkdtemp(prefix="sftp_untar_", dir=temp_root or None)
     try:
         # Step 1: extract non-_RE_ files
         for fname in non_re:
@@ -517,46 +515,26 @@ def preprocess_folder(
                 logger.warning(f"  Extract failed [{fname}]: {e}")
 
         # Step 3: classify and move/delete extracted files
-        # Use os.walk to handle tar.gz files that contain subdirectories
-        extracted_files = [
-            os.path.join(root, f)
-            for root, dirs, files in os.walk(tmp_dir)
-            for f in files
-        ]
-        logger.info(
-            f"  [PP] extracted {len(extracted_files)} file(s) into tmp_dir"
-        )
-
-        for full_path in extracted_files:
-            fname = os.path.basename(full_path)
+        for fname in os.listdir(tmp_dir):
+            full_path = os.path.join(tmp_dir, fname)
+            if not os.path.isfile(full_path):
+                continue
             try:
-                # filename format: "20250124-2200_Keyword Name_version.ext"
-                # keyword is everything between first and second underscore
-                first  = fname.index("_")
-                second = fname.index("_", first + 1)
-                keyword_name = fname[first + 1 : second]
-            except (ValueError, IndexError):
+                parts = fname.split("_")
+                keyword_name = parts[1] if len(parts) > 1 else ""
+            except Exception:
                 keyword_name = ""
 
-            in_list = keyword_name in keywords if keyword_name else False
-            logger.info(
-                f"  [PP] {fname} → keyword_name='{keyword_name}' "
-                f"in_list={in_list}"
-            )
-
-            if in_list:
+            if keyword_name and keyword_name in keywords:
                 dest_dir = os.path.join(untar_root, market_name, keyword_name)
                 os.makedirs(dest_dir, exist_ok=True)
                 dest_path = os.path.join(dest_dir, fname)
-                # overwrite if exists (same rule as _RE_ extraction)
-                if os.path.exists(dest_path):
-                    os.remove(dest_path)
                 shutil.move(full_path, dest_path)
                 moved_files.append(dest_path)
-                logger.info(f"  [PP] KEPT   → {dest_path}")
+                logger.debug(f"  Kept [{keyword_name}]: {fname}")
             else:
                 os.remove(full_path)
-                logger.info(f"  [PP] DELETED (no match): {fname}")
+                logger.debug(f"  Deleted (keyword '{keyword_name}' not in list): {fname}")
 
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -597,12 +575,14 @@ def process_folder(
 
         # ── Preprocess (untar + keyword filter) ─────────────────────────────
         untar_root = cfg["paths"]["untar"]
+        temp_root  = cfg["paths"].get("temp", "")
         moved, preproc_errors = preprocess_folder(
             task.local_date_path,
             task.market_name,
             untar_root,
             keywords,
             logger,
+            temp_root=temp_root,
         )
         for pe in preproc_errors:
             error_details.append(ErrorDetail(

@@ -13,7 +13,7 @@ sftp:
 paths:
   archive: "archive/"
   untar: "untar/"
-  temp: "tmp/"
+  temp: "tmp/"       # temporary extraction directory (created if not exists)
   log: "logs/"
 
 # Concurrency Settings
